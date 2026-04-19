@@ -1,10 +1,31 @@
 import re
 import requests
-import PyPDF2
 import sys
 import os
 import glob
 import xml.etree.ElementTree as ET
+
+# ──────────────────────────────────────────────
+# PDF 文本提取依赖：优先 PyMuPDF，其次 PyPDF2，扫描件走 OCR
+# ──────────────────────────────────────────────
+
+try:
+    import fitz  # PyMuPDF
+    HAS_FITZ = True
+except ImportError:
+    HAS_FITZ = False
+
+try:
+    import PyPDF2
+    HAS_PYPDF2 = True
+except ImportError:
+    HAS_PYPDF2 = False
+
+if not (HAS_FITZ or HAS_PYPDF2):
+    print("[!] 必须安装至少一个 PDF 库：")
+    print("    pip install PyMuPDF   （推荐，抽取质量更高）")
+    print("    pip install PyPDF2    （备选）")
+    sys.exit(1)
 
 # ──────────────────────────────────────────────
 # IEEE 期刊全称 → 标准缩写（直接硬编码，无需 IEEEabrv.bib）
@@ -258,7 +279,7 @@ def apply_ieee_conference_macros(bibtex: str) -> str:
         if normalized in IEEE_CONFERENCE_MAP:
             return f"{field_name}{{{IEEE_CONFERENCE_MAP[normalized]}}}{field_end}"
 
-        # 再做一次“被包含”匹配，处理 "2018 15th Conference on Computer and Robot Vision (CRV)"
+        # 再做一次"被包含"匹配，处理 "2018 15th Conference on Computer and Robot Vision (CRV)"
         # 这类清洗后仍可能带多余字样的情况
         for full_name, abbr in IEEE_CONFERENCE_MAP.items():
             if full_name in normalized:
@@ -403,9 +424,91 @@ def postprocess(bibtex: str) -> str:
     bibtex = protect_title_caps(bibtex)
     return bibtex
 
-# ──────────────────────────────────────────────
-# DOI 提取 & Crossref 查询
-# ──────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# 【改动 1】统一 PDF 文本提取：PyMuPDF → PyPDF2 → OCR 三级兜底链
+# ═══════════════════════════════════════════════════════════════
+
+def _extract_with_fitz(pdf_path, max_pages=2):
+    """PyMuPDF 提取，对 IEEE/Springer 等复杂排版效果明显好于 PyPDF2。"""
+    if not HAS_FITZ:
+        return ''
+    try:
+        with fitz.open(pdf_path) as doc:
+            n = min(max_pages, doc.page_count)
+            return '\n'.join(doc[i].get_text() for i in range(n))
+    except Exception as e:
+        print(f"  [-] PyMuPDF 读取失败: {e}")
+        return ''
+
+
+def _extract_with_pypdf2(pdf_path, max_pages=2):
+    """PyPDF2 提取，作为 fitz 的备选。"""
+    if not HAS_PYPDF2:
+        return ''
+    try:
+        with open(pdf_path, 'rb') as f:
+            reader = PyPDF2.PdfReader(f)
+            n = min(max_pages, len(reader.pages))
+            texts = []
+            for i in range(n):
+                t = reader.pages[i].extract_text() or ''
+                texts.append(t)
+            return '\n'.join(texts)
+    except Exception as e:
+        print(f"  [-] PyPDF2 读取失败: {e}")
+        return ''
+
+
+def _extract_with_ocr(pdf_path, max_pages=2):
+    """
+    OCR 兜底：仅在前两种方法抽不到足够文本时触发（扫描版 PDF）。
+    需要 pip install pytesseract pdf2image，以及系统包 tesseract-ocr、poppler-utils。
+    未安装时静默跳过，不影响主流程。
+    """
+    try:
+        import pytesseract
+        from pdf2image import convert_from_path
+    except ImportError:
+        return ''
+    try:
+        images = convert_from_path(pdf_path, dpi=200,
+                                   first_page=1, last_page=max_pages)
+        return '\n'.join(pytesseract.image_to_string(img, lang='eng') for img in images)
+    except Exception as e:
+        print(f"  [-] OCR 失败: {e}")
+        return ''
+
+
+def extract_text_from_pdf(pdf_path, max_pages=2, ocr_threshold=200):
+    """
+    三级文本提取链：
+      1) PyMuPDF (fitz)     —— 质量最好，解决 PyPDF2 在 DOI 处插入换行的问题
+      2) PyPDF2             —— fitz 失败或未安装时兜底
+      3) OCR (tesseract)    —— 前两步抽不到足够文本时启用（扫描版 PDF）
+
+    ocr_threshold: 非 OCR 方法抽出的文本低于这个字符数就触发 OCR。
+    """
+    text = _extract_with_fitz(pdf_path, max_pages)
+
+    if len(text.strip()) < ocr_threshold:
+        text2 = _extract_with_pypdf2(pdf_path, max_pages)
+        if len(text2.strip()) > len(text.strip()):
+            text = text2
+
+    if len(text.strip()) < ocr_threshold:
+        print(f"  [i] 直接提取仅 {len(text.strip())} chars，尝试 OCR")
+        ocr_text = _extract_with_ocr(pdf_path, max_pages)
+        if len(ocr_text.strip()) > len(text.strip()):
+            text = ocr_text
+            print(f"  [+] OCR 成功提取 {len(text.strip())} chars")
+
+    return text
+
+# ══════════════════════════════════════════════════════════════
+# 【改动 2】DOI / arXiv / Title 提取函数改为"从文本中提取"
+# 这样 process_single_pdf 只提取一次文本，后续都复用，同时避免
+# 对同一个扫描 PDF 反复触发 OCR。
+# ══════════════════════════════════════════════════════════════
 
 def _clean_doi_tail(doi: str) -> str:
     """去除 DOI 末尾常见的标点。"""
@@ -415,7 +518,7 @@ def _clean_doi_tail(doi: str) -> str:
 def _doi_candidates(doi: str):
     """
     生成 DOI 查询候选，由长到短依次尝试。
-    主要用于修复 PyPDF2 把 DOI 和下一段首词粘在一起的情况，
+    主要用于修复 PDF 抽取把 DOI 和下一段首词粘在一起的情况，
     例如 '10.1109/LRA.2026.3653382that' → '10.1109/LRA.2026.3653382'。
     """
     doi = _clean_doi_tail(doi)
@@ -426,24 +529,123 @@ def _doi_candidates(doi: str):
         yield m.group(1)
 
 
-def extract_doi_from_pdf(pdf_path):
+def extract_doi_from_text(text):
+    """
+    从已提取的 PDF 文本里找 DOI。关键改动：先把所有空白（含换行、
+    不间断空格 \\u00a0）压成单个空格，避免 PyPDF2 在 DOI 中间插入
+    换行导致匹配失败。
+    """
+    if not text:
+        return None
+    # 跨行/特殊空白拼接：这是修复文件 1 的核心
+    flat = re.sub(r'[\s\u00a0]+', ' ', text)
     doi_pattern = re.compile(r'\b(10\.\d{4,9}/[-._;()/:A-Za-z0-9]+)\b')
-    try:
-        with open(pdf_path, 'rb') as file:
-            reader = PyPDF2.PdfReader(file)
-            num_pages = min(2, len(reader.pages))
-            for i in range(num_pages):
-                text = reader.pages[i].extract_text()
-                if text:
-                    matches = doi_pattern.findall(text)
-                    if matches:
-                        doi = _clean_doi_tail(matches[0])
-                        if '10.48550' not in doi:
-                            return doi
-    except Exception as e:
-        print(f"  [-] 读取 PDF 时发生错误: {e}")
+    matches = doi_pattern.findall(flat)
+    for m in matches:
+        doi = _clean_doi_tail(m)
+        if '10.48550' not in doi:  # 排除 arXiv 的 Crossref DOI，优先走 arXiv 路径
+            return doi
     return None
 
+
+def _is_valid_arxiv_id(aid: str) -> bool:
+    """
+    校验 arXiv ID 合法性，兼容新旧两种格式。
+    新格式 YYMM.NNNNN 要求 MM 在 01-12 之间，YY 在 07-99 之间（arXiv 新格式始于 2007-04）。
+    旧格式形如 hep-th/9901001 或 cs.CV/0701001。
+    """
+    # 新格式
+    m = re.match(r'^(\d{2})(\d{2})\.\d{4,5}$', aid)
+    if m:
+        yy, mm = int(m.group(1)), int(m.group(2))
+        return 1 <= mm <= 12 and 7 <= yy <= 99
+    # 旧格式
+    if re.match(r'^[a-z\-]+(?:\.[A-Z]{2})?/\d{7}$', aid):
+        return True
+    return False
+
+
+def extract_arxiv_id_from_text(text):
+    """
+    严格要求 'arXiv' 前缀才视为 arXiv ID，避免把 DOI 里的数字串误判。
+    兼容新旧两种格式。
+    """
+    if not text:
+        return None
+    arxiv_pattern = re.compile(
+        r'arXiv\s*[:.]?\s*'
+        r'('
+        r'\d{4}\.\d{4,5}(?:v\d+)?'          # 新格式
+        r'|[a-z\-]+(?:\.[A-Z]{2})?/\d{7}'   # 旧格式
+        r')',
+        re.IGNORECASE,
+    )
+    matches = arxiv_pattern.findall(text)
+    for m in matches:
+        aid = m if isinstance(m, str) else m[0]
+        # 去掉版本后缀再做合法性校验
+        aid_base = re.sub(r'v\d+$', '', aid)
+        if _is_valid_arxiv_id(aid_base):
+            return aid_base
+    return None
+
+
+def extract_title_from_text(text):
+    """
+    从 PDF 首页正文猜标题。
+    策略：去掉页眉、页码、作者行之后，取前几行拼接。
+    """
+    if not text:
+        return None
+
+    lines = [l.strip() for l in text.split('\n') if l.strip()]
+    header_kw = re.compile(
+        r'(IEEE TRANSACTIONS|IEEE ROBOTICS|VOL\.|NO\.|Proceedings of|'
+        r'Conference on (Computer|Robot|Intelligent|Machine)|Copyright|©|ISSN|'
+        r'2377-|2162-|Authorized licensed|Downloaded on|'
+        r'The (Thirty|Fortieth|Fortyfirst|AAAI)|AAAI-\d|'
+        r'arXiv:|Manuscript received)',
+        re.IGNORECASE
+    )
+    cands = []
+    for l in lines[:30]:
+        if len(l) < 10:
+            continue
+        if l.replace(' ', '').replace('.', '').isdigit():
+            continue
+        if header_kw.search(l):
+            continue
+        # 形似作者行：逗号多且含作者编号/上标
+        if l.count(',') >= 3 and re.search(r'[\d*†‡§]', l):
+            break
+        cands.append(l)
+        if len(' '.join(cands)) > 120:
+            break
+    return ' '.join(cands[:3]) if cands else None
+
+# ══════════════════════════════════════════════════════════════
+# 【改动 3】从文件名清洗出可用标题 —— 扫描版 PDF 最后的救命稻草
+# ══════════════════════════════════════════════════════════════
+
+def clean_filename_as_title(pdf_path):
+    """
+    把 '01_Some-paper_title (v2).pdf' 清成 'Some paper title'。
+    用于 PDF 正文抽不到任何文本（扫描件）、正文标题解析又失败时兜底。
+    """
+    name = os.path.splitext(os.path.basename(pdf_path))[0]
+    # 去掉开头编号：'01_' / '(1) ' / '[3]. '
+    name = re.sub(r'^\s*[\[\(]?\d+[\]\)\.\-_\s]+', '', name)
+    # 去掉括号及其中内容：'(v2)' '(1991)'
+    name = re.sub(r'[\(\[].*?[\)\]]', '', name)
+    # 分隔符统一成空格
+    name = re.sub(r'[_\-]+', ' ', name)
+    # 压缩空白
+    name = re.sub(r'\s+', ' ', name).strip()
+    return name if len(name) >= 10 else None
+
+# ──────────────────────────────────────────────
+# Crossref 查询（按 DOI / 按标题）—— 这部分逻辑保持不变
+# ──────────────────────────────────────────────
 
 def get_bibtex_by_doi(doi):
     """查询 Crossref，失败时自动尝试 DOI 截断候选。"""
@@ -469,47 +671,82 @@ def get_bibtex_by_doi(doi):
         print(f"  [-] {last_err}")
     return None
 
-# ──────────────────────────────────────────────
-# arXiv ID 提取 & API 查询
-# ──────────────────────────────────────────────
 
-def _is_valid_arxiv_id(aid: str) -> bool:
-    """校验 arXiv ID 的月份合法性（MM 必须在 01-12 之间）。
-    可有效过滤从 DOI 数字串里误匹配到的伪 arXiv ID（如 '2026.36533'）。
-    """
-    m = re.match(r'^(\d{2})(\d{2})\.\d{4,5}$', aid)
-    if not m:
-        return False
-    yy, mm = int(m.group(1)), int(m.group(2))
-    # arXiv 新格式始于 2007 年 4 月
-    return 1 <= mm <= 12 and 7 <= yy <= 99
-
-
-def extract_arxiv_id_from_pdf(pdf_path):
-    """
-    严格要求 'arXiv' 前缀才视为 arXiv ID。
-    避免把 DOI 里的 'YYYY.NNNNN' 数字串（例如 '2026.3653382'）当成 arXiv ID。
-    """
-    arxiv_pattern = re.compile(
-        r'arXiv\s*[:.]?\s*(\d{4}\.\d{4,5})(v\d+)?',
-        re.IGNORECASE
-    )
+def get_bibtex_by_title_search(title):
+    """用 Crossref 的 bibliographic 模糊搜索接口，按标题反查 DOI，再拉 BibTeX。"""
+    url = "https://api.crossref.org/works"
+    params = {'query.bibliographic': title, 'rows': 3}
     try:
-        with open(pdf_path, 'rb') as file:
-            reader = PyPDF2.PdfReader(file)
-            num_pages = min(2, len(reader.pages))
-            for i in range(num_pages):
-                text = reader.pages[i].extract_text()
-                if text:
-                    matches = arxiv_pattern.findall(text)
-                    for m in matches:
-                        aid = m[0] if isinstance(m, tuple) else m
-                        if _is_valid_arxiv_id(aid):
-                            return aid
+        response = requests.get(url, params=params, timeout=15)
+        if response.status_code != 200:
+            return None
+        items = response.json().get('message', {}).get('items', [])
+        if not items:
+            return None
+        best = items[0]
+        best_title = (best.get('title') or [''])[0].lower()
+        q_words = set(re.findall(r'[a-z]{4,}', title.lower()))
+        t_words = set(re.findall(r'[a-z]{4,}', best_title))
+        if q_words and t_words and len(q_words & t_words) < 3:
+            print(f"  [-] Crossref 标题搜索结果相关度过低（命中 '{best_title[:50]}...'）")
+            return None
+        found_doi = best.get('DOI')
+        if not found_doi:
+            return None
+        print(f"  [+] Crossref 标题反查得到 DOI: {found_doi}")
+        return get_bibtex_by_doi(found_doi)
+    except requests.exceptions.RequestException as e:
+        print(f"  [-] 标题搜索网络请求错误: {e}")
     except Exception as e:
-        print(f"  [-] 读取 PDF 时发生错误: {e}")
+        print(f"  [-] 解析标题搜索结果时出错: {e}")
     return None
 
+# ══════════════════════════════════════════════════════════════
+# 【改动 4】OpenAlex 标题搜索 —— Crossref 未命中时的第二来源
+# 对 90 年代 IEEE TPAMI 等老论文覆盖明显好于 Crossref。
+# ══════════════════════════════════════════════════════════════
+
+def get_bibtex_by_openalex_title_search(title):
+    """
+    用 OpenAlex 按标题查，拿到 DOI 后再调 Crossref 取 BibTeX，
+    保持输出格式和主流程一致。
+    """
+    url = "https://api.openalex.org/works"
+    params = {"search": title, "per-page": 5}
+    try:
+        response = requests.get(url, params=params, timeout=15)
+        if response.status_code != 200:
+            return None
+        items = response.json().get("results", [])
+        if not items:
+            return None
+    except requests.exceptions.RequestException as e:
+        print(f"  [-] OpenAlex 网络请求错误: {e}")
+        return None
+    except Exception as e:
+        print(f"  [-] 解析 OpenAlex 响应时出错: {e}")
+        return None
+
+    # 用词集合做相关度校验，防止 OpenAlex 返回主题近似但非目标论文
+    q_words = set(re.findall(r'[a-z]{4,}', title.lower()))
+    for item in items:
+        cand_title = (item.get('title') or '').lower()
+        t_words = set(re.findall(r'[a-z]{4,}', cand_title))
+        if q_words and t_words and len(q_words & t_words) < 3:
+            continue
+        doi_url = item.get('doi') or ''
+        found_doi = doi_url.replace('https://doi.org/', '').strip() or None
+        if not found_doi:
+            continue
+        print(f"  [+] OpenAlex 匹配得到 DOI: {found_doi}")
+        bibtex = get_bibtex_by_doi(found_doi)
+        if bibtex:
+            return bibtex
+    return None
+
+# ──────────────────────────────────────────────
+# arXiv API 查询 —— 逻辑保持不变
+# ──────────────────────────────────────────────
 
 def get_bibtex_by_arxiv_id(arxiv_id):
     url = f"http://export.arxiv.org/api/query?id_list={arxiv_id}"
@@ -560,10 +797,7 @@ def get_bibtex_by_arxiv_id(arxiv_id):
             '07':'jul','08':'aug','09':'sep','10':'oct','11':'nov','12':'dec'
         }
 
-        # 按 IEEE Reference Guide v3.28.2025 §II.S 的 Preprint arXiv 格式：
-        #   J. K. Author, "Title of paper," year, arXiv:xxxx.xxxxx.
-        # IEEEtran.bst 不识别 eprint/archivePrefix/primaryClass，需要用 note/howpublished。
-        # 这里用 note 字段，让 IEEEtran 输出成 "... , 2021, arXiv:2109.07078." 样式。
+        # 按 IEEE Reference Guide v3.28.2025 §II.S 的 Preprint arXiv 格式
         arxiv_note = f"arXiv:{arxiv_id}"
         if category:
             arxiv_note += f" [{category}]"
@@ -581,82 +815,6 @@ def get_bibtex_by_arxiv_id(arxiv_id):
 
     except Exception as e:
         print(f"  [-] 解析 arXiv 响应时出错: {e}")
-    return None
-
-# ──────────────────────────────────────────────
-# 标题提取 & Crossref 标题搜索（DOI / arXiv 都失败时的兜底）
-# ──────────────────────────────────────────────
-
-def extract_title_from_pdf(pdf_path):
-    """
-    从 PDF 第一页提取可能的论文标题。
-    策略：前 30 行去掉页眉、页码、作者行之后，取前几行的拼接。
-    这串文字会送到 Crossref 的 bibliographic 模糊搜索接口，带作者反而能提高精度。
-    """
-    try:
-        with open(pdf_path, 'rb') as f:
-            reader = PyPDF2.PdfReader(f)
-            text = reader.pages[0].extract_text() or ''
-    except Exception as e:
-        print(f"  [-] 读取 PDF 时发生错误: {e}")
-        return None
-
-    lines = [l.strip() for l in text.split('\n') if l.strip()]
-    header_kw = re.compile(
-        r'(IEEE TRANSACTIONS|IEEE ROBOTICS|VOL\.|NO\.|Proceedings of|'
-        r'Conference on (Computer|Robot|Intelligent|Machine)|Copyright|©|ISSN|'
-        r'2377-|2162-|Authorized licensed|Downloaded on|'
-        r'The (Thirty|Fortieth|Fortyfirst|AAAI)|AAAI-\d|'
-        r'arXiv:|Manuscript received)',
-        re.IGNORECASE
-    )
-    cands = []
-    for l in lines[:30]:
-        if len(l) < 10:
-            continue
-        if l.replace(' ', '').replace('.', '').isdigit():
-            continue
-        if header_kw.search(l):
-            continue
-        # 形似作者行：逗号多且含作者编号/上标
-        if l.count(',') >= 3 and re.search(r'[\d*†‡§]', l):
-            break
-        cands.append(l)
-        if len(' '.join(cands)) > 120:
-            break
-    return ' '.join(cands[:3]) if cands else None
-
-
-def get_bibtex_by_title_search(title):
-    """
-    用 Crossref 的 bibliographic 模糊搜索接口，按标题反查 DOI，再拉 BibTeX。
-    """
-    url = "https://api.crossref.org/works"
-    params = {'query.bibliographic': title, 'rows': 3}
-    try:
-        response = requests.get(url, params=params, timeout=15)
-        if response.status_code != 200:
-            return None
-        items = response.json().get('message', {}).get('items', [])
-        if not items:
-            return None
-        # 取第一条，且简单校验标题是否大致匹配（避免 Crossref 乱返回）
-        best = items[0]
-        best_title = (best.get('title') or [''])[0].lower()
-        q_words = set(re.findall(r'[a-z]{4,}', title.lower()))
-        t_words = set(re.findall(r'[a-z]{4,}', best_title))
-        if q_words and t_words and len(q_words & t_words) < 3:
-            print(f"  [-] 标题搜索结果相关度过低（命中 '{best_title[:50]}...'），放弃")
-            return None
-        found_doi = best.get('DOI')
-        if not found_doi:
-            return None
-        print(f"  [+] 标题反查得到 DOI: {found_doi}")
-        return get_bibtex_by_doi(found_doi)
-    except requests.exceptions.RequestException as e:
-        print(f"  [-] 标题搜索网络请求错误: {e}")
-    except Exception as e:
-        print(f"  [-] 解析标题搜索结果时出错: {e}")
     return None
 
 # ──────────────────────────────────────────────
@@ -682,28 +840,49 @@ def collect_pdf_paths(inputs):
 
 
 def process_single_pdf(pdf_path):
-    doi = extract_doi_from_pdf(pdf_path)
+    """
+    【改动 5】全文只提取一次，逐级尝试：
+      DOI(正文) → arXiv(正文) → 标题(正文 → 文件名) → Crossref → OpenAlex
+    """
+    text = extract_text_from_pdf(pdf_path)
+
+    # 1. DOI
+    doi = extract_doi_from_text(text)
     if doi:
         print(f"  [+] 找到 DOI: {doi}，查询 Crossref...")
         bibtex = get_bibtex_by_doi(doi)
         if bibtex:
             return bibtex, 'doi'
 
-    arxiv_id = extract_arxiv_id_from_pdf(pdf_path)
+    # 2. arXiv
+    arxiv_id = extract_arxiv_id_from_text(text)
     if arxiv_id:
         print(f"  [+] 找到 arXiv ID: {arxiv_id}，查询 arXiv API...")
         bibtex = get_bibtex_by_arxiv_id(arxiv_id)
         if bibtex:
             return bibtex, 'arxiv'
 
-    # 最后一招：提取标题，走 Crossref 的模糊搜索
-    title = extract_title_from_pdf(pdf_path)
+    # 3. 标题：先从正文抽，抽不到则用文件名兜底
+    title = extract_title_from_text(text)
+    if not title:
+        title = clean_filename_as_title(pdf_path)
+        if title:
+            print(f"  [i] PDF 无可用文本层，改用文件名作为标题")
+
     if title:
-        print(f"  [+] 未找到 DOI/arXiv，尝试用标题搜索 Crossref：")
+        print(f"  [+] 未找到 DOI/arXiv，尝试用标题搜索：")
         print(f"      {title[:80]}{'...' if len(title) > 80 else ''}")
+
+        # 3a. Crossref
         bibtex = get_bibtex_by_title_search(title)
         if bibtex:
             return bibtex, 'title'
+
+        # 3b. OpenAlex 兜底
+        print(f"  [i] Crossref 标题搜索未命中，尝试 OpenAlex...")
+        bibtex = get_bibtex_by_openalex_title_search(title)
+        if bibtex:
+            return bibtex, 'openalex'
 
     return None, None
 
@@ -764,6 +943,7 @@ def main():
     success_doi = 0
     success_arxiv = 0
     success_title = 0
+    success_openalex = 0
     failed_files = []
 
     print(f"\n[*] 共找到 {total} 个 PDF，输出至: {output_path}\n")
@@ -785,19 +965,23 @@ def main():
                 elif source == 'arxiv':
                     success_arxiv += 1
                     print(f"  [OK] 写入成功（arXiv 预印本）\n")
+                elif source == 'openalex':
+                    success_openalex += 1
+                    print(f"  [OK] 写入成功（OpenAlex 兜底）\n")
                 else:
                     success_title += 1
-                    print(f"  [OK] 写入成功（标题搜索）\n")
+                    print(f"  [OK] 写入成功（Crossref 标题搜索）\n")
             else:
                 failed_files.append(pdf_path)
                 print(f"  [-] 未找到 DOI / arXiv / 标题匹配，已跳过\n")
 
     print("=" * 50)
-    total_ok = success_doi + success_arxiv + success_title
+    total_ok = success_doi + success_arxiv + success_title + success_openalex
     print(f"\n处理完成：{total_ok}/{total} 篇成功写入 {output_path}")
-    print(f"  正式 DOI         ：{success_doi} 篇")
-    print(f"  arXiv 预印本     ：{success_arxiv} 篇")
-    print(f"  标题反查（Crossref）：{success_title} 篇")
+    print(f"  正式 DOI           ：{success_doi} 篇")
+    print(f"  arXiv 预印本       ：{success_arxiv} 篇")
+    print(f"  Crossref 标题反查  ：{success_title} 篇")
+    print(f"  OpenAlex 兜底      ：{success_openalex} 篇")
 
     if failed_files:
         print(f"\n以下 {len(failed_files)} 个文件处理失败：")
@@ -805,8 +989,11 @@ def main():
             print(f"  - {f}")
         print("\n可能原因：")
         print("  • AAAI / NeurIPS / ICML 等会议不注册 Crossref DOI，且论文未上 arXiv")
-        print("  • PDF 文本抽取不完整（扫描件或特殊字体）")
+        print("  • PDF 文本抽取不完整（扫描件或特殊字体）且未安装 OCR")
+        print("  • 文件名与论文标题差异过大，模糊搜索无法命中")
         print("\n建议：")
+        print("  • 扫描版 PDF 安装 OCR：pip install pytesseract pdf2image")
+        print("    系统包：apt install tesseract-ocr poppler-utils")
         print("  • 手动到 DBLP / Google Scholar / Semantic Scholar 搜索标题获取 BibTeX")
         print("  • AAAI 论文可从 https://ojs.aaai.org/index.php/AAAI 页面导出")
 
